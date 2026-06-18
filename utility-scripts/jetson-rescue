@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+# jetson-rescue — one-shot rescue / repair shell for an installed Jetson.
+#
+# Combines jetson-mount-rootfs + jetson-chroot. From a live ISO (or any
+# host where you can reach the Jetson's disk), this script:
+#
+#   1. Finds the installed root partition:
+#        a. GPT partlabel "APP" or "APP_a"
+#        b. Filesystem label "APP"
+#        c. Any unmounted ext4 partition containing /etc/nv_tegra_release
+#   2. Mounts it at /mnt/jetson  (overridable; -r for read-only)
+#   3. Bind-mounts /dev, /dev/pts, /proc, /sys, /run
+#   4. Swaps in a working /etc/resolv.conf so apt + dns work in the chroot
+#   5. Drops you in a chroot shell  (or runs a one-shot command)
+#   6. On exit (clean OR Ctrl-C OR error), unmounts ONLY what it mounted
+#      and restores the original resolv.conf
+#
+# Usage:
+#   jetson-rescue [-r] [-d DEVICE] [MOUNTPOINT]
+#   jetson-rescue [-r] [-d DEVICE] [MOUNTPOINT] -- COMMAND [ARGS...]
+#
+#   -r           Mount the rootfs read-only (no chroot writes at all).
+#   -d DEVICE    Skip auto-detection and use this block device
+#                (e.g. /dev/nvme0n1p1).
+#   MOUNTPOINT   Default: /mnt/jetson.
+#   -- CMD       Run CMD inside the chroot non-interactively, then exit.
+#
+# Examples:
+#   sudo jetson-rescue                            # interactive repair shell
+#   sudo jetson-rescue -r                         # read-only inspect
+#   sudo jetson-rescue -d /dev/nvme0n1p1          # skip auto-detect
+#   sudo jetson-rescue -- apt update              # non-interactive run
+
+set -euo pipefail
+
+DEFAULT_MOUNT=/mnt/jetson
+MOUNT=$DEFAULT_MOUNT
+RO_OPTS=()
+FORCE_DEV=
+CMD=()
+
+usage() {
+    sed -n '/^# jetson-rescue/,/^$/p' "$0" \
+      | sed 's/^# \{0,1\}//'
+    exit "${1:-2}"
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -r)            RO_OPTS=(-o ro); shift ;;
+        -d)            FORCE_DEV=${2:?-d needs a device}; shift 2 ;;
+        -h|--help)     usage 0 ;;
+        --)            shift; CMD=("$@"); break ;;
+        -*)            echo "Unknown option: $1" >&2; usage ;;
+        *)             MOUNT=$1; shift ;;
+    esac
+done
+
+# ── Cleanup ──────────────────────────────────────────────────────────
+# Track only the mounts WE made so we don't tear down something the
+# user had set up beforehand.
+CLEANUP_QUEUE=()
+RC_RESTORE=""    # "" / "symlink:<target>" / "file"
+
+cleanup() {
+    local i path
+    for ((i=${#CLEANUP_QUEUE[@]}-1; i>=0; i--)); do
+        path=${CLEANUP_QUEUE[i]}
+        if mountpoint -q "$path" 2>/dev/null; then
+            sudo umount "$path" 2>/dev/null \
+              || sudo umount -l "$path" 2>/dev/null \
+              || true
+        fi
+    done
+    # Restore the target's original /etc/resolv.conf
+    case "$RC_RESTORE" in
+        symlink:*)
+            sudo rm -f "$MOUNT/etc/resolv.conf"
+            sudo ln -sf "${RC_RESTORE#symlink:}" "$MOUNT/etc/resolv.conf"
+            ;;
+        file)
+            if [ -f "$MOUNT/etc/resolv.conf.jetson-rescue.bak" ]; then
+                sudo mv "$MOUNT/etc/resolv.conf.jetson-rescue.bak" \
+                        "$MOUNT/etc/resolv.conf"
+            fi
+            ;;
+    esac
+}
+trap cleanup EXIT INT TERM
+
+# ── Find APP partition ───────────────────────────────────────────────
+find_app_partition() {
+    local d probe
+    for d in /dev/disk/by-partlabel/APP /dev/disk/by-partlabel/APP_a; do
+        [ -e "$d" ] && { readlink -f "$d"; return 0; }
+    done
+    d=$(blkid -o device -t LABEL=APP 2>/dev/null | head -1)
+    [ -n "$d" ] && { echo "$d"; return 0; }
+    probe=$(mktemp -d)
+    while read -r dev fstype mnt; do
+        [ "$fstype" = ext4 ] || continue
+        [ -z "$mnt" ] || continue
+        if sudo mount -o ro "$dev" "$probe" 2>/dev/null; then
+            if [ -f "$probe/etc/nv_tegra_release" ]; then
+                sudo umount "$probe"
+                rmdir "$probe"
+                echo "$dev"
+                return 0
+            fi
+            sudo umount "$probe"
+        fi
+    done < <(lsblk -ln -o PATH,FSTYPE,MOUNTPOINT)
+    rmdir "$probe"
+    return 1
+}
+
+# ── Resolve device ───────────────────────────────────────────────────
+if [ -n "$FORCE_DEV" ]; then
+    DEV=$FORCE_DEV
+else
+    DEV=$(find_app_partition) || {
+        echo "Could not find an installed Jetson rootfs (APP partition)." >&2
+        echo "Available partitions:" >&2
+        lsblk -o NAME,SIZE,FSTYPE,PARTLABEL,LABEL,MOUNTPOINT >&2
+        exit 1
+    }
+fi
+[ -b "$DEV" ] || { echo "Not a block device: $DEV" >&2; exit 1; }
+
+# ── Mount rootfs (skip if already mounted at our target) ─────────────
+if mountpoint -q "$MOUNT"; then
+    current=$(findmnt -no SOURCE "$MOUNT")
+    if [ "$current" != "$DEV" ]; then
+        echo "$MOUNT is busy (currently $current); refusing to overlay." >&2
+        exit 1
+    fi
+    echo "[jetson-rescue] $DEV already at $MOUNT (won't unmount on exit)"
+else
+    sudo mkdir -p "$MOUNT"
+    sudo mount "${RO_OPTS[@]}" "$DEV" "$MOUNT"
+    CLEANUP_QUEUE+=("$MOUNT")
+    echo "[jetson-rescue] Mounted $DEV${RO_OPTS:+ (ro)} at $MOUNT"
+fi
+
+# ── Bind mounts (order matters: /dev before /dev/pts) ────────────────
+for d in dev dev/pts proc sys run; do
+    if ! mountpoint -q "$MOUNT/$d"; then
+        sudo mount --bind "/$d" "$MOUNT/$d"
+        CLEANUP_QUEUE+=("$MOUNT/$d")
+    fi
+done
+
+# ── resolv.conf ──────────────────────────────────────────────────────
+# Only meaningful when the rootfs is writable. Handle three cases —
+# regular file, symlink (valid or broken), or missing. [ -e ] follows
+# symlinks so it cannot tell a broken symlink from "missing"; check
+# [ -L ] first.
+if [ "${#RO_OPTS[@]}" -eq 0 ]; then
+    RC="$MOUNT/etc/resolv.conf"
+    if [ -L "$RC" ]; then
+        RC_RESTORE="symlink:$(readlink "$RC")"
+        sudo rm -f "$RC"
+    elif [ -f "$RC" ]; then
+        RC_RESTORE="file"
+        sudo mv "$RC" "$RC.jetson-rescue.bak"
+    fi
+    sudo cp -L /etc/resolv.conf "$RC"
+fi
+
+# ── Run shell or one-shot command ────────────────────────────────────
+if [ ${#CMD[@]} -gt 0 ]; then
+    sudo chroot "$MOUNT" "${CMD[@]}"
+else
+    echo "[jetson-rescue] Entering chroot at $MOUNT. Exit shell to unmount."
+    sudo chroot "$MOUNT" /bin/bash --login
+fi

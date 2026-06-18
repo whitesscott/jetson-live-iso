@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# rsync-based backup of a Jetson rootfs.
+#
+# Source: an installed Jetson rootfs (defaults to /mnt/jetson if mounted,
+# otherwise /).  Target: a local directory OR a remote ssh path
+# (user@host:/path).  Use --restore to swap the direction.
+#
+# Excludes the obvious virtual filesystems, swap files, and apt deb cache.
+# Preserves ACLs, xattrs, hardlinks, and numeric UIDs/GIDs.
+#
+# Usage:
+#   jetson-backup [-s SOURCE] [-n] [--restore] TARGET
+#     -s SOURCE   Override the default source.
+#     -n          Dry run (passes --dry-run to rsync).
+#     --restore   Reverse: copy TARGET back onto SOURCE.
+#
+# Examples:
+#   jetson-backup /mnt/usb/jetson-2026-06-15           # backup running / to USB
+#   jetson-backup -s /mnt/jetson user@nas:/backups/orin
+#   jetson-backup --restore -s / /mnt/jetson           # restore live -> APP
+
+set -euo pipefail
+
+usage() { sed -n '/^# /,/^$/p' "$0" | sed 's/^# \{0,1\}//' | head -22; exit "${1:-2}"; }
+
+SOURCE=
+DRY=
+RESTORE=
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -s)        SOURCE=$2; shift 2 ;;
+        -n)        DRY=--dry-run; shift ;;
+        --restore) RESTORE=1; shift ;;
+        -h|--help) usage 0 ;;
+        --)        shift; break ;;
+        -*)        usage ;;
+        *)         break ;;
+    esac
+done
+
+TARGET=${1:-}
+[ -n "$TARGET" ] || usage
+
+# Pick source
+if [ -z "$SOURCE" ]; then
+    if mountpoint -q /mnt/jetson; then
+        SOURCE=/mnt/jetson
+    else
+        SOURCE=/
+    fi
+fi
+
+# Swap for restore
+if [ -n "$RESTORE" ]; then
+    src=$TARGET; dst=$SOURCE
+else
+    src=$SOURCE; dst=$TARGET
+fi
+
+# Ensure source ends in / so we copy contents, not the dir
+case "$src" in */) ;; *) src="$src/" ;; esac
+
+# Targets that look remote (host:path) skip the local mkdir
+if ! [[ $dst == *":"* ]]; then
+    sudo mkdir -p "$dst"
+fi
+
+EXCLUDES=(
+    --exclude=/dev/*
+    --exclude=/proc/*
+    --exclude=/sys/*
+    --exclude=/run/*
+    --exclude=/tmp/*
+    --exclude=/mnt/*
+    --exclude=/media/*
+    --exclude=/lost+found
+    --exclude=/var/cache/apt/archives/*.deb
+    --exclude=/var/tmp/*
+    --exclude=/var/lib/systemd/coredump/*
+    --exclude=/swapfile
+    --exclude=/swap.img
+    --exclude=/cdrom
+    --exclude=/rofs
+)
+
+echo "[jetson-backup] $src  -->  $dst${DRY:+   (dry-run)}"
+sudo rsync -aAXH --numeric-ids --delete-before \
+    --info=progress2,stats2 \
+    $DRY \
+    "${EXCLUDES[@]}" \
+    "$src" "$dst"
+echo "[jetson-backup] done"

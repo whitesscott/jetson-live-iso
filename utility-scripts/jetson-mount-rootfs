@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# Find and mount an installed Jetson rootfs (the APP partition) at /mnt/jetson.
+#
+# Detection order:
+#   1. GPT partlabel "APP" or "APP_a" (A/B slot active root)
+#   2. Filesystem label "APP"
+#   3. Any unmounted ext4 partition that contains /etc/nv_tegra_release
+#
+# Usage:
+#   jetson-mount-rootfs [-r] [-d DEVICE] [MOUNTPOINT]
+#     -r           Mount read-only (recommended for backups / inspection)
+#     -d DEVICE    Skip detection and mount this device (e.g. /dev/nvme0n1p1)
+#     MOUNTPOINT   Default: /mnt/jetson
+
+set -euo pipefail
+
+readonly DEFAULT_MOUNT=/mnt/jetson
+
+usage() { sed -n '/^# /,/^$/p' "$0" | sed 's/^# \{0,1\}//' | head -16; exit "${1:-2}"; }
+
+RO_OPTS=()
+FORCE_DEV=
+while getopts ":rd:h" opt; do
+    case "$opt" in
+        r) RO_OPTS=(-o ro) ;;
+        d) FORCE_DEV=$OPTARG ;;
+        h) usage 0 ;;
+        ?) usage ;;
+    esac
+done
+shift $((OPTIND-1))
+MOUNT=${1:-$DEFAULT_MOUNT}
+
+find_app_partition() {
+    local d
+    # 1. by GPT partlabel
+    for d in /dev/disk/by-partlabel/APP /dev/disk/by-partlabel/APP_a; do
+        [ -e "$d" ] && readlink -f "$d" && return 0
+    done
+    # 2. by filesystem label
+    d=$(blkid -o device -t LABEL=APP 2>/dev/null | head -1)
+    [ -n "$d" ] && echo "$d" && return 0
+    # 3. scan unmounted ext4 partitions for nv_tegra_release
+    local probe parts
+    probe=$(mktemp -d)
+    trap 'rm -rf "$probe"' RETURN
+    while read -r dev fstype mnt; do
+        [ "$fstype" = ext4 ] || continue
+        [ -z "$mnt" ] || continue
+        if sudo mount -o ro "$dev" "$probe" 2>/dev/null; then
+            if [ -f "$probe/etc/nv_tegra_release" ]; then
+                sudo umount "$probe"
+                echo "$dev"
+                return 0
+            fi
+            sudo umount "$probe"
+        fi
+    done < <(lsblk -ln -o PATH,FSTYPE,MOUNTPOINT)
+    return 1
+}
+
+if [ -n "$FORCE_DEV" ]; then
+    DEV=$FORCE_DEV
+else
+    DEV=$(find_app_partition) || {
+        echo "Could not find a Jetson APP partition." >&2
+        echo "Available partitions:" >&2
+        lsblk -o NAME,SIZE,FSTYPE,PARTLABEL,LABEL,MOUNTPOINT >&2
+        exit 1
+    }
+fi
+[ -b "$DEV" ] || { echo "Not a block device: $DEV" >&2; exit 1; }
+
+if mountpoint -q "$MOUNT"; then
+    current=$(findmnt -no SOURCE "$MOUNT")
+    if [ "$current" = "$DEV" ]; then
+        echo "$DEV already mounted at $MOUNT" >&2
+        exit 0
+    fi
+    echo "$MOUNT is busy (currently $current)" >&2
+    exit 1
+fi
+
+sudo mkdir -p "$MOUNT"
+sudo mount "${RO_OPTS[@]}" "$DEV" "$MOUNT"
+printf 'Mounted %s%s at %s\n' "$DEV" "${RO_OPTS:+ (read-only)}" "$MOUNT"

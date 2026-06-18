@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# Chroot into the installed Jetson rootfs (mounted at /mnt/jetson by default).
+# Sets up /dev, /dev/pts, /proc, /sys, /run binds and a working resolv.conf so
+# `apt`, `dpkg`, networking and systemctl --inspect all behave. Cleans up
+# every bind on exit, even on Ctrl-C.
+#
+# Usage:
+#   jetson-chroot [MOUNTPOINT]
+#   jetson-chroot [MOUNTPOINT] -- COMMAND [ARGS...]    # non-interactive
+
+set -euo pipefail
+
+readonly DEFAULT_MOUNT=/mnt/jetson
+MOUNT=$DEFAULT_MOUNT
+CMD=()
+
+# Parse: optional first positional, then "--" terminator + command
+if [ "${1-}" = "-h" ] || [ "${1-}" = "--help" ]; then
+    sed -n '/^# /,/^$/p' "$0" | sed 's/^# \{0,1\}//' | head -10; exit 0
+fi
+if [ "${1-}" != "--" ] && [ -n "${1-}" ]; then
+    MOUNT=$1; shift
+fi
+if [ "${1-}" = "--" ]; then
+    shift; CMD=("$@")
+fi
+
+# Mount the rootfs if needed (helper script must be in PATH)
+if ! mountpoint -q "$MOUNT"; then
+    if command -v jetson-mount-rootfs >/dev/null 2>&1; then
+        jetson-mount-rootfs "$MOUNT"
+    else
+        echo "$MOUNT is not mounted, and jetson-mount-rootfs is not available." >&2
+        echo "Mount it manually first: sudo mount /dev/disk/by-partlabel/APP $MOUNT" >&2
+        exit 1
+    fi
+fi
+
+BINDS=(dev dev/pts proc sys run)
+RC_RESTORE=""    # "" / "symlink:<target>" / "file"
+
+cleanup() {
+    # Reverse order so /dev/pts unmounts before /dev
+    local d
+    for ((i=${#BINDS[@]}-1; i>=0; i--)); do
+        d=${BINDS[i]}
+        if mountpoint -q "$MOUNT/$d" 2>/dev/null; then
+            sudo umount "$MOUNT/$d" 2>/dev/null \
+              || sudo umount -l "$MOUNT/$d" 2>/dev/null \
+              || true
+        fi
+    done
+    # Restore the target's original /etc/resolv.conf
+    case "$RC_RESTORE" in
+        symlink:*)
+            sudo rm -f "$MOUNT/etc/resolv.conf"
+            sudo ln -sf "${RC_RESTORE#symlink:}" "$MOUNT/etc/resolv.conf"
+            ;;
+        file)
+            if [ -f "$MOUNT/etc/resolv.conf.jetson-chroot.bak" ]; then
+                sudo mv "$MOUNT/etc/resolv.conf.jetson-chroot.bak" \
+                        "$MOUNT/etc/resolv.conf"
+            fi
+            ;;
+    esac
+}
+trap cleanup EXIT INT TERM
+
+# Bind mounts
+sudo mount --bind /dev      "$MOUNT/dev"
+sudo mount --bind /dev/pts  "$MOUNT/dev/pts"
+sudo mount --bind /proc     "$MOUNT/proc"
+sudo mount --bind /sys      "$MOUNT/sys"
+sudo mount --bind /run      "$MOUNT/run"
+
+# Resolv.conf: handle three cases — regular file, valid OR broken symlink,
+# or missing. [ -e ] follows symlinks so it can't distinguish a broken
+# symlink from "missing"; use [ -L ] instead.
+RC="$MOUNT/etc/resolv.conf"
+if [ -L "$RC" ]; then
+    RC_RESTORE="symlink:$(readlink "$RC")"
+    sudo rm -f "$RC"
+elif [ -f "$RC" ]; then
+    RC_RESTORE="file"
+    sudo mv "$RC" "$RC.jetson-chroot.bak"
+fi
+sudo cp -L /etc/resolv.conf "$RC"
+
+if [ ${#CMD[@]} -gt 0 ]; then
+    sudo chroot "$MOUNT" "${CMD[@]}"
+else
+    echo "[jetson-chroot] Entering chroot at $MOUNT. Exit shell to unmount."
+    sudo chroot "$MOUNT" /bin/bash --login
+fi

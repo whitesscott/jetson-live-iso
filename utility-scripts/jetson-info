@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# Quick triage / status summary for a Jetson Orin or Thor.
+# Safe to run on either the live ISO or an installed system.
+
+set -u
+
+section() { printf '\n\033[1;34m== %s ==\033[0m\n' "$*"; }
+
+section "Tegra"
+if [ -f /proc/device-tree/compatible ]; then
+    tr '\0' '\n' </proc/device-tree/compatible | head -3
+fi
+if [ -f /proc/device-tree/model ]; then
+    printf 'Model:     '
+    tr -d '\0' </proc/device-tree/model
+    echo
+fi
+
+section "JetPack / L4T"
+if [ -f /etc/nv_tegra_release ]; then
+    head -2 /etc/nv_tegra_release
+fi
+[ -f /etc/os-release ] && grep -E '^(PRETTY_NAME|VERSION)=' /etc/os-release
+echo  "Kernel:    $(uname -r)"
+echo  "Uptime:    $(uptime -p)"
+
+section "CPU / RAM"
+printf 'CPUs:      %s online\n' "$(grep -c '^processor' /proc/cpuinfo)"
+free -h | awk '/^Mem:/{printf "RAM:       %s total, %s used, %s avail\n", $2, $3, $7}'
+free -h | awk '/^Swap:/{printf "Swap:      %s total, %s used\n", $2, $3}'
+if command -v nvpmodel >/dev/null 2>&1; then
+    sudo nvpmodel -q 2>/dev/null | sed 's/^/NVP:       /'
+fi
+
+section "Storage"
+lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINT,PARTLABEL,LABEL | grep -Ev '^loop|^sr'
+
+section "Network"
+ip -4 -br addr 2>/dev/null | awk '$2 != "DOWN" && $2 != "UNKNOWN"'
+gw=$(ip route show default 2>/dev/null | awk 'NR==1{print $3}')
+[ -n "$gw" ] && echo "Gateway:   $gw"
+ns=$(awk '/^nameserver/{print $2}' /etc/resolv.conf 2>/dev/null | head -3 | xargs)
+[ -n "$ns" ] && echo "DNS:       $ns"
+sshd=$(systemctl is-active ssh 2>/dev/null || echo "inactive")
+echo "SSH:       $sshd"
+
+section "Thermals"
+for z in /sys/class/thermal/thermal_zone*; do
+    [ -f "$z/temp" ] || continue
+    name=$(cat "$z/type" 2>/dev/null)
+    temp=$(cat "$z/temp")
+    awk -v n="$name" -v t="$temp" 'BEGIN{printf "  %-22s %5.1f C\n", n, t/1000}'
+done | sort -u
+
+if command -v nvidia-smi >/dev/null 2>&1; then
+    section "nvidia-smi"
+    nvidia-smi 2>/dev/null
+fi
+
+if [ -f /sys/devices/gpu.0/load ]; then
+    section "Tegra GPU"
+    load=$(cat /sys/devices/gpu.0/load 2>/dev/null)
+    [ -n "$load" ] && awk -v l="$load" 'BEGIN{printf "Load:      %.1f%%\n", l/10}'
+fi
+
+section "Fan"
+for f in /sys/class/thermal/cooling_device*/cur_state; do
+    [ -f "$f" ] || continue
+    dev=$(cat "${f%/cur_state}/type" 2>/dev/null)
+    cur=$(cat "$f")
+    max=$(cat "${f%/cur_state}/max_state" 2>/dev/null)
+    [ "$cur" != 0 ] || [ "$dev" = fan ] && \
+        printf "  %-22s %s/%s\n" "$dev" "$cur" "$max"
+done
+echo

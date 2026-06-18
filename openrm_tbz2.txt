@@ -1,0 +1,24 @@
+~/.git/jp7.2/Linux_for_Tegra$ sudo ./nv_tools/scripts/nv_l4t_get_package_install_list.sh --bsp ~/.git/jp7.2/Linux_for_Tegra --type tbz2 --openrm
+/home/scott/.git/jp7.2/Linux_for_Tegra/nv_tegra/graphics_demos.tbz2
+/home/scott/.git/jp7.2/Linux_for_Tegra/nv_tegra/nv_tools.tbz2
+/home/scott/.git/jp7.2/Linux_for_Tegra/nv_tegra/nvidia_l4t_multimedia_openrm.tbz2
+/home/scott/.git/jp7.2/Linux_for_Tegra/nv_tegra/nvidia_l4t_firmware_nvgpu.tbz2
+/home/scott/.git/jp7.2/Linux_for_Tegra/nv_tegra/nvidia_l4t_cuda_openrm.tbz2
+/home/scott/.git/jp7.2/Linux_for_Tegra/nv_tegra/nv_optee.tbz2
+/home/scott/.git/jp7.2/Linux_for_Tegra/nv_tegra/weston.tbz2
+/home/scott/.git/jp7.2/Linux_for_Tegra/nv_tegra/nvidia_l4t_firmware_openrm.tbz2
+/home/scott/.git/jp7.2/Linux_for_Tegra/nv_tegra/nvidia_drivers.tbz2
+/home/scott/.git/jp7.2/Linux_for_Tegra/nv_tegra/nvidia_l4t_init_openrm.tbz2
+/home/scott/.git/jp7.2/Linux_for_Tegra/nv_tegra/config.tbz2
+/home/scott/.git/jp7.2/Linux_for_Tegra/nv_tegra/nvidia_l4t_multimedia_nvgpu.tbz2
+/home/scott/.git/jp7.2/Linux_for_Tegra/nv_tegra/nvidia_l4t_video_codec_openrm.tbz2
+/home/scott/.git/jp7.2/Linux_for_Tegra/nv_tegra/nvidia_l4t_cuda_nvgpu.tbz2
+/home/scott/.git/jp7.2/Linux_for_Tegra/nv_tegra/nvidia_l4t_vulkan_sc_nvgpu.tbz2
+/home/scott/.git/jp7.2/Linux_for_Tegra/nv_tegra/nvidia_l4t_vulkan_sc_openrm.tbz2
+/home/scott/.git/jp7.2/Linux_for_Tegra/kernel/kernel_oot_headers.tbz2
+/home/scott/.git/jp7.2/Linux_for_Tegra/kernel/nvidia_l4t_kernel_openrm.tbz2
+/home/scott/.git/jp7.2/Linux_for_Tegra/kernel/kernel_headers.tbz2
+/home/scott/.git/jp7.2/Linux_for_Tegra/kernel/nvidia_l4t_kernel_nvgpu.tbz2
+/home/scott/.git/jp7.2/Linux_for_Tegra/kernel/kernel_display_supplements.tbz2
+/home/scott/.git/jp7.2/Linux_for_Tegra/kernel/kernel_oot_modules.tbz2
+/home/scott/.git/jp7.2/Linux_for_Tegra/kernel/kernel_supplements.tbz2

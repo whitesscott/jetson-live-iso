@@ -1,0 +1,5 @@
+build/
+iso-editable/
+jetsoninstaller-*.iso
+logs/
+photos/
