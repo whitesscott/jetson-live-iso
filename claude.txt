@@ -1,3 +1,0 @@
-claude --resume d749e7b9-4e99-49cd-beb6-e0711297e246
-
-# scp -4 jetson/build/jetson-live.iso white@chiOmen:"C:/Users/white/dts/"
