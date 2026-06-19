@@ -42,7 +42,7 @@ its run.
 
 - **Host**: arm64 (aarch64). The build does not cross-compile — run it on
   a Jetson device, not a desktop x86 box.
-- **Source ISO**: `jetsoninstaller-r39.2.0-*.iso` from NVIDIA. The build
+- **Source ISO**: `jetsoninstaller-r39.2.0-*.iso`. The build
   reuses this ISO's UEFI boot artifacts, kernel, and platform packages.
 - **Free disk**: ~20 GB in the directory where you run the script.
 - **Tools**: `debootstrap`, `mtools`, `xorriso`, `squashfs-tools`. The
@@ -60,7 +60,7 @@ The live ISO's GRUB menu has:
    JetPack release.
 3. **Install Jetson ISO r39.2.0** — the original JetPack installer's
    six install entries (NVMe / USB / eMMC / microSD / rescue / disc check),
-   preserved verbatim. The same USB stick is also a JetPack installer.
+   preserved verbatim. The same USB stick flashes a Jetson Jetpack 7.2.
 4. **Boot from next volume** / **UEFI Firmware Settings** — standard GRUB.
 
 ## Live system extras
@@ -75,14 +75,14 @@ Built into the squashfs:
 
 The utility scripts in `utility-scripts/` are **not** baked into the ISO
 (too easy for an unintended file to break GUI). To use them on a running
-live system, `scp` whichever ones you want into `/usr/local/bin/`:
+live system, `scp` whichever ones you need into it:
 
 | Script | Purpose |
 |---|---|
 | `jetson-info` | One-screen status: SKU, JetPack version, RAM, NVP mode, lsblk, networking, thermals, GPU. |
 | `jetson-mount-rootfs` | Mount the installed APP partition at `/mnt/jetson` (auto-detects via GPT label, FS label, or `/etc/nv_tegra_release`). |
 | `jetson-chroot` | Set up bind mounts on a mounted `/mnt/jetson` and drop into a chroot shell. |
-| `jetson-rescue` | One-shot combo: mount + chroot in one command. The usual choice for "boot live, fix installed system". |
+| `jetson-rescue` | One-shot combo: mount + chroot in one script. The usual choice for "boot live, fix installed system". |
 | `jetson-backup` | `rsync -aAXH --numeric-ids` of an installed rootfs to local or remote. |
 
 ## Stages the build runs
@@ -127,7 +127,7 @@ comment block above it. Highlights:
 `build-THOR-live-iso.sh` includes a chain of fixes that are *not* needed
 on Orin but are mandatory on Thor. If you're ever wondering "why is this
 in the script", the deep reference is `openrm_tbz2.txt` (the authoritative
-list of tbz2 packages that NVIDIA's `apply_binaries.sh --openrm` ships).
+list of tbz2 packages that L4T `apply_binaries.sh --openrm` installs).
 NVIDIA's apt-installable `.debs` are missing pieces that the tbz2 path
 ships, and several modprobe configs / firmware blobs must be pre-deployed.
 The script does this automatically.
@@ -159,11 +159,11 @@ script doesn't:
 - Username: `ubuntu-server`, hostname: `ubuntu-server` (set by casper from
   the source ISO's `.disk/info` flavour string).
 - Password: empty (PAM autologin only). Set a password with
-  `sudo passwd ubuntu-server` before SSH-in.
+  `sudo passwd ubuntu-server` before ssh or scp in.
 - The first ~7 kernel warnings in the top-left during boot are benign
   (regulator/HWPM probe noise). The GUI comes up after them.
 - On shutdown the kernel will sometimes hang on 4+ USB read-after-end
-  lines while detaching the live media. Press the Orin/Thor reset
+  lines while detaching the live USB partitions. Press the Orin/Thor reset
   button to restart the board.
 
 ## License

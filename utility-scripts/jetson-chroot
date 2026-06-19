@@ -76,6 +76,12 @@ sudo mount --bind /run      "$MOUNT/run"
 # Resolv.conf: handle three cases — regular file, valid OR broken symlink,
 # or missing. [ -e ] follows symlinks so it can't distinguish a broken
 # symlink from "missing"; use [ -L ] instead.
+#
+# DNS strategy: build chroot's resolv.conf from the live system's
+# nameservers (minus the systemd-resolved stub at 127.0.0.53 which is
+# unusable inside the chroot) plus 1.1.1.1 and 8.8.8.8 fallbacks so
+# apt update / curl etc. work even if the live system's resolv.conf
+# only points at the resolved stub.
 RC="$MOUNT/etc/resolv.conf"
 if [ -L "$RC" ]; then
     RC_RESTORE="symlink:$(readlink "$RC")"
@@ -84,7 +90,13 @@ elif [ -f "$RC" ]; then
     RC_RESTORE="file"
     sudo mv "$RC" "$RC.jetson-chroot.bak"
 fi
-sudo cp -L /etc/resolv.conf "$RC"
+{
+    cat /etc/resolv.conf 2>/dev/null \
+        | grep -E '^nameserver[[:space:]]+[0-9a-fA-F:.]+' \
+        | grep -vE 'nameserver[[:space:]]+127\.0\.0\.53' || true
+    echo "nameserver 1.1.1.1"
+    echo "nameserver 8.8.8.8"
+} | sudo tee "$RC" > /dev/null
 
 if [ ${#CMD[@]} -gt 0 ]; then
     sudo chroot "$MOUNT" "${CMD[@]}"

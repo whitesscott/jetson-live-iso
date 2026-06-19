@@ -48,7 +48,7 @@
 #
 # Output:
 #   $BUILD_DIR/jetson-thor-live.iso
-#
+
 
 set -euo pipefail
 
@@ -189,7 +189,7 @@ log "Installing platform-specific packages from source ISO (~3 min)"
 # host1x_syncpt_get_shim_info, ...) that live in NVIDIA's out-of-tree
 # tegra-drm.ko / host1x.ko / nvhost-*.ko. Without them modprobe loads
 # nvidia.ko, fails the symbol relocation, and prints the error in a
-# tight loop. The -module-configs package ships
+# tight loop. The -kernel-module-configs package ships
 # /etc/modprobe.d/nvidia-preferred-oot-modules.conf which biases
 # modprobe toward the OOT versions over the in-tree ones.
 #
@@ -200,7 +200,7 @@ log "Installing platform-specific packages from source ISO (~3 min)"
 # any crtc or sizes" -- there's no display surface bridge to the SoC
 # engine -- and downstream the X session hits "Wait for channel idle
 # timed out". The openrm tbz2 install set treats nv_optee.tbz2 as
-# mandatory for Thor; we'd been missing it.
+# mandatory for Thor; I'd been missing it.
 #
 # vulkan-sc-{openrm,nvgpu} and multimedia-nvgpu are pulled in for parity
 # with the openrm tbz2 install list, so the Vulkan SC ICD JSONs and
@@ -351,8 +351,8 @@ sudo chroot "$CHROOT" systemctl enable jetson-set-xorg-busid.service 2>&1 | tail
 # never appears. The installed JetPack 7.2 desktop runs on X11 (mutter-
 # x11-frame is in its process list, not mutter-wayland). Match that.
 sudo install -d -m 755 "$CHROOT/etc/gdm3"
-# Replace custom.conf wholesale: enable autologin for the live "ubuntu"
-# user AND disable Wayland. Casper-bottom/15autologin will sed-replace
+# Replace custom.conf wholesale: enable autologin for the live
+# "ubuntu-server" user AND disable Wayland. Casper-bottom/15autologin will sed-replace
 # commented placeholders, but if our placeholders aren't in the right
 # shape it silently no-ops -- safer to write the final config directly.
 sudo tee "$CHROOT/etc/gdm3/custom.conf" > /dev/null <<'EOF'
@@ -416,9 +416,9 @@ log "SSH: enable by default + drop-in to regen host keys on first start"
 # first, then the config test. Host keys are removed at build time so
 # every live boot generates a fresh, unique set on first start.
 #
-# NOTE: the live user "ubuntu" has an empty password by default and
+# NOTE: the live user "ubuntu-server" has an empty password by default and
 # sshd's PermitEmptyPasswords defaults to "no", so SSH-in still requires
-# `sudo passwd ubuntu` first (or an authorized_keys entry). The service
+# `sudo passwd ubuntu-server` first (or an authorized_keys entry). The service
 # itself is just listening and ready.
 sudo chroot "$CHROOT" systemctl enable ssh.service 2>&1 | tail -2 || true
 sudo rm -f "$CHROOT/etc/ssh/ssh_host_"*
@@ -436,8 +436,8 @@ if [ -f /cdrom/casper/desktop/filesystem.squashfs ] && [ -z "$JETSON_LIVE_HINT_S
   export JETSON_LIVE_HINT_SHOWN=1
   echo
   echo "[ Jetson Live ] sshd is already running. To allow SSH-in:"
-  echo "    sudo passwd ubuntu               # set a password (one-time)"
-  echo "    ssh ubuntu@\$(hostname -I | awk '{print \$1}')"
+  echo "    sudo passwd ubuntu-server   # set a password (one-time)"
+  echo "    ssh ubuntu-server@\$(hostname -I | awk '{print \$1}')"
   echo
 fi
 EOF
@@ -451,9 +451,9 @@ sudo tee "$CHROOT/etc/motd" > /dev/null <<'EOF'
   Nothing is persisted across reboots unless you install
   to internal storage.
 
-  Live user:  ubuntu  (empty password by default)
+  Live user:  ubuntu-server  (empty password by default)
   SSH:        sshd is running. Set a password with
-                "sudo passwd ubuntu"
+                "sudo passwd ubuntu-server"
               before SSH-in works (empty passwords rejected).
 
   To install to disk:
@@ -474,11 +474,61 @@ for f in /etc/apt/sources.list.d/*.list; do
     [ -f "$f" ] || continue
     sed -i '/^[[:space:]]*deb[[:space:]]\+cdrom:/d' "$f"
 done
-if getent passwd ubuntu >/dev/null 2>&1; then
-    echo 'ubuntu:ubuntu' | chpasswd
+if getent passwd ubuntu-server >/dev/null 2>&1; then
+    echo 'ubuntu-server:ubuntu-server' | chpasswd
 fi
 EOF
 sudo chmod 755 "$CHROOT/usr/local/sbin/jetson-live-tweaks"
+
+# Copy utility-scripts/ into /opt/utility-scripts/ in the chroot.
+# Intentionally NOT on $PATH -- run as /opt/utility-scripts/<name> when
+# wanted. Idempotent: install -m re-copies cleanly. Skipped if no
+# utility-scripts/ directory exists alongside this build script.
+if [ -d "$HERE/utility-scripts" ]; then
+    log "Installing utility-scripts -> /opt/utility-scripts/"
+    sudo install -d -m 755 "$CHROOT/opt/utility-scripts"
+    for f in "$HERE"/utility-scripts/*; do
+        [ -f "$f" ] || continue
+        sudo install -m 755 "$f" "$CHROOT/opt/utility-scripts/$(basename "$f")"
+    done
+fi
+
+# Quiet NetworkManager's "Activation of network connection failed"
+# notification on the desktop. On Jetsons multiple Ethernet interfaces
+# show up (mgbe0_0..mgbe3_0) and only one is typically plugged in; NM
+# tries to activate all of them every ~30s and the gnome-shell notifier
+# pops the failure each time.
+#
+# Two complementary knobs:
+#   1. NM connection defaults: limit auto-connect retries to 1 so NM
+#      stops retrying failed activations indefinitely. Wired connections
+#      still come up on first try when a cable is present.
+#   2. dconf: silence the gnome-shell "connection-removed"/"activation-
+#      failed" notifications from NetworkManager source so they never
+#      reach the screen.
+sudo install -d -m 755 "$CHROOT/etc/NetworkManager/conf.d"
+sudo tee "$CHROOT/etc/NetworkManager/conf.d/00-jetson-no-retry.conf" > /dev/null <<'EOF'
+# Stop retrying failed auto-connect attempts. Cable-plugged wired ports
+# still come up on their first attempt; ports with no cable / no DHCP
+# server give up after one try instead of every 30s forever.
+[connection]
+connection.autoconnect-retries=1
+EOF
+
+sudo install -d -m 755 "$CHROOT/etc/dconf/db/local.d"
+sudo tee "$CHROOT/etc/dconf/db/local.d/01-jetson-no-nm-notify" > /dev/null <<'EOF'
+# Suppress GNOME notifications from the NetworkManager applet. With
+# autoconnect-retries=1 above the underlying retry storm stops too, but
+# this keeps any remaining transient errors from popping a toast.
+[org/gnome/desktop/notifications/application/gnome-network-panel]
+enable=false
+
+[org/gnome/desktop/notifications/application/nm-applet]
+enable=false
+EOF
+# dconf update was already invoked earlier in the script for the
+# terminal-font defaults; we re-run it so this new key file is compiled.
+sudo chroot "$CHROOT" dconf update
 
 # Pre-deploy the OpenRM (Thor) display module configs that
 # nv-load-display-modules.service would normally deploy at first boot.
@@ -554,7 +604,7 @@ WantedBy=display-manager.service
 EOF
 sudo chroot "$CHROOT" systemctl enable jetson-add-live-user-groups.service 2>&1 | tail -2 || true
 
-# Three configs that NVIDIA's apply_binaries.sh (tbz2 path) drops on
+# Three configs that NVIDIA's apply_binaries.sh --openrm (tbz2 path) drops on
 # installed systems but that the apt-installable .deb doesn't ship.
 # Without these:
 #   - nvidia.ko boots without NVreg_TegraGpuPgMask=512 (Thor-specific
@@ -619,7 +669,7 @@ else
 fi
 
 # The Tegra kernel package doesn't ship /boot/config-* so initramfs-tools
-# can't verify CONFIG_RD_ZSTD. Use gzip; universally supported.
+# can't verify CONFIG_RD_ZSTD. Therefore use gzip; universally supported.
 sudo sed -i 's/^COMPRESS=.*/COMPRESS=gzip/' "$CHROOT/etc/initramfs-tools/initramfs.conf"
 
 # Quiet the "W: Possible missing firmware /lib/firmware/nvidia/tegraNNN/xusb.bin"
@@ -697,7 +747,7 @@ sudo du -sx --block-size=1 "$CHROOT" | awk '{print $1}' \
 sudo cp "$CHROOT/boot/initrd.img-$KVER" "$CASPER/initrd-live"
 
 # Restore the original placeholder filesystem.manifest/size used by the
-# server-installer flow (they got overwritten earlier when we naively
+# server-installer flow (they got overwritten earlier when I naively
 # treated /casper/ as the live squashfs location).
 TMP_RESTORE="$BUILD_DIR/restore"
 mkdir -p "$TMP_RESTORE"
@@ -745,7 +795,7 @@ submenu "Install Jetson ISO r39.2.0" {
         initrd /casper/initrd
     }
 
-    menuentry "Install on microSD (for AGX Orin, Orin Nano/NX)" {
+    menuentry "Install on microSD (for Orin Nano/NX)" {
         linux /casper/Image autoinstall fsck.mode=skip force-bootdisk=mmcblkn mminit_loglevel=4 clk_ignore_unused pd_ignore_unused firmware_class.path=/etc/firmware fbcon=map:0 nospectre_bhb efi=runtime rd.driver.blacklist=nouveau nouveau.modeset=0 cloud-init=disabled loglevel=debug subiquity.debug
         initrd /casper/initrd
     }
