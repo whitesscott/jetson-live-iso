@@ -189,6 +189,41 @@ if [ "${#RO_OPTS[@]}" -eq 0 ]; then
     } | sudo tee "$RC" > /dev/null
 fi
 
+# ── NVIDIA L4T apt source ───────────────────────────────────────────
+# Optionally deploy the NVIDIA L4T r39.2 (JetPack 7.2) apt source to the
+# target if it doesn't already have ANY nvidia source. Persistent: this
+# is a real repair, not a transient setup. Skipped silently when:
+#   - rootfs is mounted read-only (-r)
+#   - target already has /etc/apt/sources.list.d/*nvidia*.list (don't
+#     stomp on an older JetPack target whose r36.x source is correct
+#     for it -- writing r39.2 to a JetPack-6 install would break apt)
+#   - the signing key isn't available in any known location (the live
+#     ISO ships it at /usr/share/keyrings/jetson-ota-public.asc, the
+#     build script also drops it at /opt/utility-scripts/, or you can
+#     place it next to this script).
+if [ "${#RO_OPTS[@]}" -eq 0 ] \
+   && ! find "$MOUNT/etc/apt/sources.list.d" -maxdepth 1 -name '*nvidia*.list' \
+        -type f 2>/dev/null | grep -q .; then
+    KEYSRC=
+    for k in /opt/utility-scripts/jetson-ota-public.asc \
+             /usr/share/keyrings/jetson-ota-public.asc \
+             "$(dirname "$(readlink -f "$0")")/jetson-ota-public.asc"; do
+        [ -f "$k" ] && { KEYSRC=$k; break; }
+    done
+    if [ -n "$KEYSRC" ]; then
+        echo "[jetson-rescue] Target has no nvidia apt source -- deploying r39.2"
+        sudo install -d -m 755 "$MOUNT/usr/share/keyrings" \
+                                "$MOUNT/etc/apt/sources.list.d"
+        sudo install -m 644 "$KEYSRC" \
+            "$MOUNT/usr/share/keyrings/jetson-ota-public.asc"
+        sudo tee "$MOUNT/etc/apt/sources.list.d/nvidia-l4t.list" > /dev/null <<'NVAPT'
+deb [signed-by=/usr/share/keyrings/jetson-ota-public.asc] https://repo.download.nvidia.com/jetson/common r39.2 main
+deb [signed-by=/usr/share/keyrings/jetson-ota-public.asc] https://repo.download.nvidia.com/jetson/som r39.2 main
+deb [signed-by=/usr/share/keyrings/jetson-ota-public.asc] https://repo.download.nvidia.com/jetson/ffmpeg r39.2 main
+NVAPT
+    fi
+fi
+
 # ── Run shell or one-shot command ────────────────────────────────────
 if [ ${#CMD[@]} -gt 0 ]; then
     sudo chroot "$MOUNT" "${CMD[@]}"

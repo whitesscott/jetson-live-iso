@@ -54,8 +54,8 @@ set -euo pipefail
 
 # ── Paths ────────────────────────────────────────────────────────────
 HERE="$(cd "$(dirname "$0")" && pwd)"
-BUILD_DIR="$HERE/build"
-ISO_TREE="$HERE/iso-editable"
+BUILD_DIR="$HERE/build-thor"
+ISO_TREE="$HERE/iso-editable-thor"
 CHROOT="$BUILD_DIR/chroot"
 OUTPUT_ISO="$BUILD_DIR/jetson-thor-live.iso"
 EFI_IMG="$BUILD_DIR/efi.img"
@@ -256,7 +256,9 @@ sudo chroot "$CHROOT" /bin/bash -c '
     openssh-server openssh-client \
     iputils-ping iputils-tracepath \
     nano vim less \
-    xserver-xorg-legacy
+    wget curl \
+    xserver-xorg-legacy \
+    systemd systemd-sysv systemd-timesyncd libsystemd-shared
 '
 
 # ── 6. Configure chroot ──────────────────────────────────────────────
@@ -480,10 +482,43 @@ fi
 EOF
 sudo chmod 755 "$CHROOT/usr/local/sbin/jetson-live-tweaks"
 
+# Live-system DNS: write a static /etc/resolv.conf with public fallbacks
+# and tell NetworkManager not to overwrite it.
+#
+# Why static rather than systemd-resolved FallbackDNS: on this live
+# system systemd-resolved isn't running (casper / NetworkManager handles
+# resolv.conf instead). The noble default symlink
+#   /etc/resolv.conf -> /run/systemd/resolve/resolv.conf
+# is therefore a broken symlink at runtime and nothing resolves until
+# NM rewrites it. NM-supplied DNS (DHCP, IPv6 RA) ends up in
+# /run/NetworkManager/no-stub-resolv.conf but doesn't reach /etc/resolv.conf.
+#
+# Simplest reliable fix: replace the symlink with a real file holding
+# 1.1.1.1 and 8.8.8.8, and tell NM rc-manager=unmanaged so it leaves
+# the file alone. NM still resolves DNS internally for its own needs;
+# legacy tools that getaddrinfo() through /etc/resolv.conf get the
+# public servers.
+log "Configuring live-system DNS (static /etc/resolv.conf with 1.1.1.1 + 8.8.8.8)"
+sudo rm -f "$CHROOT/etc/resolv.conf"
+sudo tee "$CHROOT/etc/resolv.conf" > /dev/null <<'EOF'
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+EOF
+sudo install -d -m 755 "$CHROOT/etc/NetworkManager/conf.d"
+sudo tee "$CHROOT/etc/NetworkManager/conf.d/01-jetson-static-dns.conf" > /dev/null <<'EOF'
+# Don't manage /etc/resolv.conf -- it's static, written by the live ISO
+# build script with public DNS fallbacks. NM-supplied DNS (DHCP, IPv6 RA)
+# is still tracked internally and visible via "nmcli dev show".
+[main]
+rc-manager=unmanaged
+EOF
+
 # Copy utility-scripts/ into /opt/utility-scripts/ in the chroot.
 # Intentionally NOT on $PATH -- run as /opt/utility-scripts/<name> when
 # wanted. Idempotent: install -m re-copies cleanly. Skipped if no
 # utility-scripts/ directory exists alongside this build script.
+# Also drop the NVIDIA L4T signing key next to the scripts so
+# jetson-rescue can deploy the apt source onto a rescue target.
 if [ -d "$HERE/utility-scripts" ]; then
     log "Installing utility-scripts -> /opt/utility-scripts/"
     sudo install -d -m 755 "$CHROOT/opt/utility-scripts"
@@ -491,6 +526,10 @@ if [ -d "$HERE/utility-scripts" ]; then
         [ -f "$f" ] || continue
         sudo install -m 755 "$f" "$CHROOT/opt/utility-scripts/$(basename "$f")"
     done
+    if [ -f "$HERE/apt/jetson-ota-public.asc" ]; then
+        sudo install -m 644 "$HERE/apt/jetson-ota-public.asc" \
+            "$CHROOT/opt/utility-scripts/jetson-ota-public.asc"
+    fi
 fi
 
 # Quiet NetworkManager's "Activation of network connection failed"
@@ -711,6 +750,52 @@ deb http://ports.ubuntu.com/ubuntu-ports noble-backports main restricted univers
 APT
   rm -rf /opt/nvidia/l4t-packages
 '
+
+# Deploy the NVIDIA L4T apt repo so the live system can `apt install`
+# nvidia-l4t-* packages without manually adding the source.
+#   apt/jetson-ota-public.asc           -> /usr/share/keyrings/
+#   apt/nvidia-l4t-apt-source.list      -> /etc/apt/sources.list.d/
+# We pin the keyring on the deb lines (signed-by=...) so apt validates
+# the signature without trusting the key globally.
+if [ -f "$HERE/apt/jetson-ota-public.asc" ] \
+   && [ -f "$HERE/apt/nvidia-l4t-apt-source.list" ]; then
+    log "Deploying NVIDIA L4T apt source + signing key"
+    sudo install -d -m 755 "$CHROOT/usr/share/keyrings" "$CHROOT/etc/apt/sources.list.d"
+    sudo install -m 644 "$HERE/apt/jetson-ota-public.asc" \
+        "$CHROOT/usr/share/keyrings/jetson-ota-public.asc"
+    # Re-emit the source list with signed-by= so apt uses our keyring.
+    sudo tee "$CHROOT/etc/apt/sources.list.d/nvidia-l4t.list" > /dev/null <<'NVIDIA_APT'
+deb [signed-by=/usr/share/keyrings/jetson-ota-public.asc] https://repo.download.nvidia.com/jetson/common r39.2 main
+deb [signed-by=/usr/share/keyrings/jetson-ota-public.asc] https://repo.download.nvidia.com/jetson/som r39.2 main
+deb [signed-by=/usr/share/keyrings/jetson-ota-public.asc] https://repo.download.nvidia.com/jetson/ffmpeg r39.2 main
+NVIDIA_APT
+fi
+
+# Baseline system clock. Jetson Thor / Orin have no RTC battery; on
+# every cold boot the kernel falls back to its compile-time epoch
+# (months in the past). apt rejects Ubuntu Release files as "not yet
+# valid" until NTP sync completes. systemd-timesyncd reads the mtime of
+# /var/lib/systemd/timesync/clock at every boot and bumps the system
+# clock to at least that timestamp -- a "clock can never go backwards"
+# guarantee. Touching the file here with the current build time means
+# the live ISO always starts up at a timestamp newer than the Release
+# files' signing date.
+#
+# Also enable timesyncd and configure NTP fallbacks (pool.ntp.org +
+# time.cloudflare.com) so once the network comes up the clock syncs to
+# real time within seconds. The default ntp.ubuntu.com fallback isn't
+# always reachable.
+log "Setting baseline system clock + enabling timesyncd"
+sudo install -d -m 755 "$CHROOT/var/lib/systemd/timesync"
+sudo touch "$CHROOT/var/lib/systemd/timesync/clock"
+sudo install -d -m 755 "$CHROOT/etc/systemd/timesyncd.conf.d"
+sudo tee "$CHROOT/etc/systemd/timesyncd.conf.d/jetson-ntp.conf" > /dev/null <<'EOF'
+[Time]
+NTP=pool.ntp.org time.cloudflare.com
+FallbackNTP=ntp.ubuntu.com time.google.com
+EOF
+sudo chroot "$CHROOT" systemctl enable systemd-timesyncd.service 2>&1 | tail -2 || true
+
 # mksquashfs records the root inode's uid/gid; chroot dir owned by builder
 # would leak into the squashfs (uid 1000 owns "/" on live boot). Reset to root.
 sudo chown root:root "$CHROOT"
@@ -843,7 +928,7 @@ log "Done: $OUTPUT_ISO  ($(du -h "$OUTPUT_ISO" | cut -f1))"
 log ""
 log "Burn with: 1, 2, or 3"
 log " 1. Balena Etcher"
-log " 2. sudo apt install usb-creator-gtk and then: usb-creator-gtk; Click 'other' to select build/jetson-thor-live.iso"
+log " 2. sudo apt install usb-creator-gtk and then: usb-creator-gtk; Click 'other' to select build-thor/jetson-thor-live.iso"
 log " 3. sudo wipefs -a /dev/sdX"
 log "    sudo dd if=$OUTPUT_ISO of=/dev/sdX bs=4M status=progress conv=fsync oflag=direct"
 log "    sudo sync"

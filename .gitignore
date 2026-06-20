@@ -1,6 +1,6 @@
-build/
-iso-editable/
+build-thor/
+build-orin/
+iso-editable-thor/
+iso-editable-orin/
 jetsoninstaller-*.iso
-logs/
-photos/
-claude.txt
+*.log
