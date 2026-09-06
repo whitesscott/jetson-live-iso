@@ -61,11 +61,11 @@ OUTPUT_ISO="$BUILD_DIR/jetson-orin-live.iso"
 EFI_IMG="$BUILD_DIR/efi.img"
 KVER="6.8.12-1021-tegra"
 
-# Hardcoded for the June 2026 source ISO layout. If a future source ISO
-# uses a different partition layout these need re-deriving with
-# `xorriso -indev <iso> -report_system_area plain`.
-EFI_PART_START=8833024   # LBA-512 of GPT partition 2 ("Appended2") in source ISO
-EFI_PART_BLOCKS=1048576  # 512 MB
+# EFI partition (GPT partition 2, "Appended2") gets re-appended verbatim
+# to our output ISO as the ESP. Its start LBA and length change whenever
+# NVIDIA re-cuts the installer (r39.2.0 = LBA 8833024; r39.2.1 = LBA
+# 8785920), so derive them live from the source ISO instead of hardcoding.
+# See derive_efi_part() below (called after SOURCE_ISO is validated).
 
 # ── Helpers ──────────────────────────────────────────────────────────
 log()  { printf '\033[1;34m::\033[0m %s\n' "$*" >&2; }
@@ -98,6 +98,26 @@ shopt -u nullglob
 [ -f "$SOURCE_ISO" ] || die "Source ISO not found: $SOURCE_ISO"
 log "Source ISO: $SOURCE_ISO"
 
+# Derive the EFI partition offset/length from the source ISO's GPT table.
+#
+# `xorriso -indev <iso> -report_system_area plain` dumps every GPT entry.
+# The "Appended2" partition (partition #2, GPT type GUID
+# 28732ac11ff8d211ba4b00a0c93ec93b == EFI System Partition, little-endian
+# mixed) is the one we want. The "GPT start and size" line has the format:
+#
+#   GPT start and size :   <n>  <start_lba_512>  <block_count_512>
+#
+# Manual equivalent for debugging:
+#   xorriso -indev "$SOURCE_ISO" -report_system_area plain 2>/dev/null \
+#     | awk '/^GPT start and size / && $6=="2" {print $7, $8}'
+read -r EFI_PART_START EFI_PART_BLOCKS < <(
+    xorriso -indev "$SOURCE_ISO" -report_system_area plain 2>/dev/null \
+      | awk '/^GPT start and size / && $6=="2" {print $7, $8; exit}'
+)
+[ -n "${EFI_PART_START:-}" ] && [ -n "${EFI_PART_BLOCKS:-}" ] \
+    || die "Could not derive EFI partition offset from $SOURCE_ISO (no GPT partition 2?)"
+log "Source EFI partition: LBA $EFI_PART_START, $EFI_PART_BLOCKS blocks ($((EFI_PART_BLOCKS/2048)) MB)"
+
 need=()
 for pkg in debootstrap mtools xorriso squashfs-tools; do
     dpkg -s "$pkg" >/dev/null 2>&1 || need+=("$pkg")
@@ -125,11 +145,17 @@ if [ ! -s "$EFI_IMG" ]; then
 fi
 
 # ── 3. Debootstrap noble arm64 base ──────────────────────────────────
+# ports.ubuntu.com's CDN has intermittent bad edges that stall wget mid-
+# stream (0 bytes/s for 10+ min). Override with MIRROR=... on the command
+# line if the default is misbehaving. Known-fast alternatives:
+#   MIRROR=http://mirrors.ocf.berkeley.edu/ubuntu-ports
+#   MIRROR=http://mirrors.mit.edu/ubuntu-ports
+MIRROR="${MIRROR:-http://ports.ubuntu.com/ubuntu-ports}"
 if [ ! -d "$CHROOT/etc" ]; then
-    log "debootstrap noble arm64 -> $CHROOT (~5 min)"
+    log "debootstrap noble arm64 from $MIRROR -> $CHROOT (~5 min)"
     sudo debootstrap --arch=arm64 --variant=minbase \
         --include=ca-certificates,gnupg,apt-utils \
-        noble "$CHROOT" http://ports.ubuntu.com/ubuntu-ports/
+        noble "$CHROOT" "$MIRROR"
 fi
 
 # ── 4. Bind-mount chroot, configure apt ──────────────────────────────
@@ -142,12 +168,50 @@ sudo mkdir -p "$CHROOT/media/jetson"
 sudo mountpoint -q "$CHROOT/media/jetson" || sudo mount --bind "$ISO_TREE" "$CHROOT/media/jetson"
 sudo cp /etc/resolv.conf "$CHROOT/etc/resolv.conf"
 
-sudo tee "$CHROOT/etc/apt/sources.list" > /dev/null <<'EOF'
-deb http://ports.ubuntu.com/ubuntu-ports noble main restricted universe multiverse
-deb http://ports.ubuntu.com/ubuntu-ports noble-updates main restricted universe multiverse
-deb http://ports.ubuntu.com/ubuntu-ports noble-security main restricted universe multiverse
-deb http://ports.ubuntu.com/ubuntu-ports noble-backports main restricted universe multiverse
-deb [trusted=yes] file:///media/jetson noble main restricted
+# The source ISO's /media/jetson InRelease is signed by an NVIDIA-internal
+# key (fingerprint 5E62373C3E8236A0D1123818208CE844D9F220AD, uid
+# "dgx-cosmos-support") -- NOT the public jetson-ota-public key used for
+# the shipped repo.download.nvidia.com repos. Without this key in the
+# build chroot's trusted set, apt-get update prints
+#   W: GPG error ... NO_PUBKEY 208CE844D9F220AD
+#   E: The repository 'file:/media/jetson noble InRelease' is not signed.
+# and every subsequent apt-get install refuses to touch the /media/jetson
+# pool, so nvidia-l4t-* installs fail.
+#
+# We drop the key into /etc/apt/trusted.gpg.d/, mirroring step 6 of
+# NVIDIA's "Add or Replace a Package" guide (which targets the shipped
+# rootfs squashfs; we target the build chroot instead since we replace
+# that squashfs wholesale). With the key globally trusted here, the
+# /media/jetson deb line needs no per-repo attributes.
+if [ -f "$HERE/apt/nvidia-iso-signing-key.asc" ]; then
+    sudo install -d -m 755 "$CHROOT/etc/apt/trusted.gpg.d"
+    # Dearmor to binary .gpg to match the convention of the other files in
+    # trusted.gpg.d/ (ubuntu-keyring-2012-cdimage.gpg, etc.). Noble apt
+    # accepts .asc too, but sticking with the format the rest of the
+    # directory uses avoids surprising anyone auditing it later.
+    # gpg runs unprivileged; only the output write needs sudo, so pipe
+    # through `sudo tee` (a bare `>` redirect is opened by the caller's
+    # shell before sudo takes effect and fails with "Permission denied").
+    # GNUPGHOME is set to a scratch dir so gpg doesn't touch the invoking
+    # user's ~/.gnupg (which may have inconsistent ownership from prior
+    # sudo runs, producing "unsafe ownership on homedir" noise). Our
+    # dearmor is stateless -- no keyring lookup -- so a scratch dir is
+    # equivalent.
+    GPG_TMP=$(mktemp -d)
+    GNUPGHOME="$GPG_TMP" gpg --dearmor \
+        < "$HERE/apt/nvidia-iso-signing-key.asc" \
+        | sudo tee "$CHROOT/etc/apt/trusted.gpg.d/nvidia-iso-signing-key.gpg" \
+          > /dev/null
+    rm -rf "$GPG_TMP"
+    sudo chmod 644 "$CHROOT/etc/apt/trusted.gpg.d/nvidia-iso-signing-key.gpg"
+fi
+
+sudo tee "$CHROOT/etc/apt/sources.list" > /dev/null <<EOF
+deb $MIRROR noble main restricted universe multiverse
+deb $MIRROR noble-updates main restricted universe multiverse
+deb $MIRROR noble-security main restricted universe multiverse
+deb $MIRROR noble-backports main restricted universe multiverse
+deb file:///media/jetson noble main restricted
 EOF
 
 # nvidia-l4t-* preinst/postinst skip flag (avoids live-system hardware checks)
@@ -181,6 +245,19 @@ sudo chroot "$CHROOT" /bin/bash -c '
 '
 
 log "Installing fonts, SSH, editors, network tools"
+# plymouth + plymouth-label + kbd are for casper's shutdown flow. On shutdown,
+# final.target -> casper.service -> /sbin/casper-stop tries to detach the live
+# USB and prompt "Please remove the installation medium, then press ENTER".
+# casper-stop's preferred path is `chvt 63; plymouth message --text=...;
+# plymouth watch-keystroke`. Without plymouth it falls back to
+# `echo $MSG > /dev/console` which gets buried under kernel block-device
+# unmount messages -- the user sees only the kernel noise and never the
+# prompt. kbd provides chvt (not pulled in by anything else in the minimal
+# desktop). plymouth-label is the "text message" renderer plymouth needs
+# for the message API; the graphical splash plugins pull it as a Depends
+# but we're intentionally not enabling a splash theme -- text-mode message
+# on the framebuffer is sufficient and avoids DRM-master fights with the
+# NVIDIA display stack at shutdown time.
 sudo chroot "$CHROOT" /bin/bash -c '
   export DEBIAN_FRONTEND=noninteractive LC_ALL=C
   apt-get install -y --no-install-recommends \
@@ -188,7 +265,9 @@ sudo chroot "$CHROOT" /bin/bash -c '
     openssh-server openssh-client \
     iputils-ping iputils-tracepath \
     nano vim less \
+    gnome-text-editor \
     wget curl \
+    plymouth plymouth-label kbd \
     systemd systemd-sysv systemd-timesyncd libsystemd-shared
 '
 
@@ -217,12 +296,19 @@ sudo tee "$CHROOT/etc/fonts/conf.d/99-ubuntu-mono-default.conf" > /dev/null <<'E
 </fontconfig>
 EOF
 
-log "dconf: GNOME Terminal default font"
+log "dconf: GNOME Terminal default font + login-shell mode"
+# login-shell=true makes gnome-terminal spawn bash as `bash -l`, so
+# /etc/profile.d/*.sh runs for every new terminal window. Without it,
+# gnome-terminal opens non-login interactive shells and the SSH-hint
+# banner we drop in /etc/profile.d/00-jetson-live.sh never fires
+# (ssh-in and tty logins already get login shells, so they were fine --
+# only the desktop terminal was missing it).
 sudo install -d -m 755 "$CHROOT/etc/dconf/db/local.d" "$CHROOT/etc/dconf/profile"
 sudo tee "$CHROOT/etc/dconf/db/local.d/00-jetson-terminal" > /dev/null <<'EOF'
 [org/gnome/terminal/legacy/profiles:/:b1dcc9dd-5262-4d8d-a863-c897e6d979b9]
 use-system-font=false
 font='Ubuntu Mono 12'
+login-shell=true
 EOF
 sudo tee "$CHROOT/etc/dconf/profile/user" > /dev/null <<'EOF'
 user-db:user

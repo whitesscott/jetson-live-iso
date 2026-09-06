@@ -2,5 +2,9 @@ build-thor/
 build-orin/
 iso-editable-thor/
 iso-editable-orin/
+Jetpack7.2/
 jetsoninstaller-*.iso
+forum-post.txt
 *.log
+extracted-installer-squashfs/
+scott/
