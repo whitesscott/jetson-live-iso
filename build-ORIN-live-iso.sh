@@ -245,19 +245,16 @@ sudo chroot "$CHROOT" /bin/bash -c '
 '
 
 log "Installing fonts, SSH, editors, network tools"
-# plymouth + plymouth-label + kbd are for casper's shutdown flow. On shutdown,
-# final.target -> casper.service -> /sbin/casper-stop tries to detach the live
-# USB and prompt "Please remove the installation medium, then press ENTER".
-# casper-stop's preferred path is `chvt 63; plymouth message --text=...;
-# plymouth watch-keystroke`. Without plymouth it falls back to
-# `echo $MSG > /dev/console` which gets buried under kernel block-device
-# unmount messages -- the user sees only the kernel noise and never the
-# prompt. kbd provides chvt (not pulled in by anything else in the minimal
-# desktop). plymouth-label is the "text message" renderer plymouth needs
-# for the message API; the graphical splash plugins pull it as a Depends
-# but we're intentionally not enabling a splash theme -- text-mode message
-# on the framebuffer is sufficient and avoids DRM-master fights with the
-# NVIDIA display stack at shutdown time.
+# Intentionally NO plymouth: plymouth's "text" theme actively renders
+# boot progress to /dev/console (it's designed for headless servers),
+# and its graphical themes fight NVIDIA's DRM stack on Jetson for
+# framebuffer control. Either mode makes boot scroll the full kernel
+# log instead of the silent "quiet splash" experience. Casper's shutdown
+# prompt is handled through casper-stop's /dev/console fallback: the
+# "Please remove installation medium, then press ENTER" message gets
+# buried in the kernel unmount messages, but the system does complete
+# poweroff/reboot on its own ~20s after the eject. See forum-post.txt
+# for the user-facing shutdown flow.
 sudo chroot "$CHROOT" /bin/bash -c '
   export DEBIAN_FRONTEND=noninteractive LC_ALL=C
   apt-get install -y --no-install-recommends \
@@ -267,7 +264,6 @@ sudo chroot "$CHROOT" /bin/bash -c '
     nano vim less \
     gnome-text-editor \
     wget curl \
-    plymouth plymouth-label kbd \
     systemd systemd-sysv systemd-timesyncd libsystemd-shared
 '
 
